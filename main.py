@@ -1,0 +1,662 @@
+import re
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+import os
+import base64
+from googleapiclient.discovery import build
+import openpyxl
+
+# Gmail API Scopes (adjust as needed)
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.labels',
+    'https://www.googleapis.com/auth/gmail.readonly'
+]
+
+def parse_bool_field(value, rule_name, field_name):
+    """
+    For boolean fields (both conditions and actions), allow only: True, False, or empty.
+    Empty is interpreted as True.
+    Otherwise, throw a ValueError indicating which rule has an error.
+    """
+    if value is None or str(value).strip() == "":
+        return True
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    elif normalized == "false":
+        return False
+    else:
+        raise ValueError(f"Error in rule '{rule_name}': Field '{field_name}' must be True, False, or empty. Got: {value}")
+
+def get_gmail_service():
+    print("Initializing Gmail service...")
+    creds = None
+    token_path = 'resources/token.json'
+    credentials_path = 'resources/credentials.json'
+
+    print(f"Checking for existing token at {token_path}")
+    if os.path.exists(token_path):
+        print("Found existing token, loading credentials...")
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    else:
+        print("No existing token found.")
+    
+    if not creds or not creds.valid:
+        print("Credentials are invalid or expired.")
+        if creds and creds.expired and creds.refresh_token:
+            print("Attempting to refresh expired token...")
+            creds.refresh(Request())
+            print("Token refreshed successfully.")
+        else:
+            print("Need to generate new token...")
+            flow = InstalledAppFlow.from_client_secrets_file(
+                credentials_path,
+                SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+            print("New token generated.")
+        
+        print(f"Saving token to {token_path}")
+        with open(token_path, 'w') as token:
+            token.write(creds.to_json())
+    
+    print("Building Gmail service...")
+    service = build('gmail', 'v1', credentials=creds)
+    print("Gmail service initialized successfully!")
+    return service
+
+def load_rules_from_excel(file_path, sheet_name=None):
+    """Load rules from an Excel file from a specified sheet.
+    Sheet structure:
+      1: Name (irrelevant)
+      2: Description (irrelevant)
+      3: Category (irrelevant)
+      4: Rule Type
+      5: Condition Type 1
+      6: Condition Value 1
+      7: Condition Type 2
+      8: Condition Value 2
+      9: Condition Type 3
+      10: Condition Value 3
+      11: Action
+      12: Action Value
+    """
+    print("Loading rules from Excel...")
+    rules = []
+    workbook = openpyxl.load_workbook(file_path)
+    
+    if sheet_name and sheet_name in workbook.sheetnames:
+        print(f"Loading rules from sheet: {sheet_name}")
+        sheet = workbook[sheet_name]
+    else:
+        print("Sheet not specified or not found; using active sheet.")
+        sheet = workbook.active
+
+    for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):  # Skip header
+        rule_type = row[3]
+        if not rule_type or (isinstance(rule_type, str) and rule_type.lower() == 'none'):
+            continue
+
+        rule = {
+            'name': str(row[0]) if row[0] else f"Rule_{row_idx}",
+            'rule_type': str(rule_type).lower() if rule_type else None,
+            'conditions': [],
+            'action': str(row[10]).lower() if row[10] and str(row[10]).lower() != 'none' else None,
+            'action_value': str(row[11]) if row[11] and str(row[11]).lower() != 'none' else None
+        }
+
+        condition_pairs = [
+            (row[4], row[5]),  # Condition 1
+            (row[6], row[7]),  # Condition 2
+            (row[8], row[9])   # Condition 3
+        ]
+
+        for cond_type, cond_value in condition_pairs:
+            if cond_type and cond_value and str(cond_type).lower() != 'none':
+                rule['conditions'].append({
+                    'type': str(cond_type).lower(),
+                    'value': str(cond_value).lower()
+                })
+        
+        print(f"Loaded rule: {rule['name']}")
+        print(f"  Rule Type: {rule['rule_type']}")
+        print(f"  Conditions: {len(rule['conditions'])}")
+        print(f"  Action: {rule['action']} -> {rule['action_value']}")
+        rules.append(rule)
+    
+    return rules
+
+def evaluate_conditions(conditions, subject, sender, body, email_date, labels, service, is_important=False, attachments=None, replies_count=0):
+    subject_lower = subject.lower() if subject else ''
+    sender_lower = sender.lower() if sender else ''
+    body_lower = body.lower() if body else ''
+
+    print("\n--- evaluate_conditions ---")
+    print(f"Subject: {subject_lower}")
+    print(f"Sender: {sender_lower}")
+    print(f"Body snippet: {body_lower[:50]}...")
+    print(f"Labels: {labels}")
+    print(f"Is Important?: {is_important}")
+    print(f"Attachments: {attachments}")
+    print(f"Replies Count: {replies_count}")
+
+    for idx, condition in enumerate(conditions, 1):
+        cond_type = condition['type'].lower()
+        cond_value = condition['value'].strip()
+
+        print(f"\nCondition {idx}:")
+        print(f"  Type: {cond_type}")
+        print(f"  Value (raw): {condition['value']}")
+        print(f"  Value (processed): {cond_value}")
+
+        if cond_type == 'none':
+            print("  Condition type is 'none'; skipping.")
+            continue
+
+        if cond_type == 'sender':
+            field_value = sender_lower
+            print(f"  Checking sender against: {field_value}")
+            if cond_value.startswith('[') and cond_value.endswith(']'):
+                expression = cond_value[1:-1]
+                result = evaluate_logical_expression(expression, field_value)
+                print(f"  Expression: {expression}, result: {result}")
+                if not result:
+                    return False
+            else:
+                if cond_value not in field_value:
+                    print("  Substring not found in sender -> condition fails.")
+                    return False
+
+        elif cond_type == 'subject':
+            field_value = subject_lower
+            print(f"  Checking subject against: {field_value}")
+            if cond_value.startswith('[') and cond_value.endswith(']'):
+                expression = cond_value[1:-1]
+                result = evaluate_logical_expression(expression, field_value)
+                print(f"  Expression: {expression}, result: {result}")
+                if not result:
+                    return False
+            else:
+                if cond_value not in field_value:
+                    print("  Substring not found in subject -> condition fails.")
+                    return False
+
+        elif cond_type == 'body':
+            field_value = body_lower
+            print(f"  Checking body against: {field_value[:50]}...")
+            if cond_value.startswith('[') and cond_value.endswith(']'):
+                expression = cond_value[1:-1]
+                result = evaluate_logical_expression(expression, field_value)
+                print(f"  Expression: {expression}, result: {result}")
+                if not result:
+                    return False
+            else:
+                if cond_value not in field_value:
+                    print("  Substring not found in body -> condition fails.")
+                    return False
+
+        elif cond_type == 'date':
+            print(f"  Checking date: {email_date}")
+            m = re.match(r'^\[\s*(<|<=|>|>=|==)\s*([\d]{4}-[\d]{2}-[\d]{2})\s*\]$', cond_value)
+            if m:
+                op, cond_date_str = m.groups()
+                cond_date = datetime.strptime(cond_date_str, '%Y-%m-%d')
+                if op == '<' and not (email_date < cond_date):
+                    return False
+                elif op == '<=' and not (email_date <= cond_date):
+                    return False
+                elif op == '>' and not (email_date > cond_date):
+                    return False
+                elif op == '>=' and not (email_date >= cond_date):
+                    return False
+                elif op == '==' and not (email_date == cond_date):
+                    return False
+            else:
+                if cond_value.lower().strip('[]') not in email_date.strftime('%Y-%m-%d').lower():
+                    return False
+
+        elif cond_type == 'important':
+            try:
+                cond_bool = parse_bool_field(cond_value, rule_name=condition.get('name','<unknown>'), field_name="important condition")
+            except ValueError as e:
+                print(e)
+                return False
+            actual_bool = is_important
+            print(f"  Checking important: expected {cond_bool}, actual {actual_bool}")
+            if cond_bool != actual_bool:
+                return False
+
+        elif cond_type == 'tag':
+            if cond_value in ["true", "false", ""]:
+                try:
+                    cond_bool = parse_bool_field(cond_value, rule_name=condition.get('name','<unknown>'), field_name="tag condition")
+                except ValueError as e:
+                    print(e)
+                    return False
+                print(f"  Error: Boolean tag conditions are not supported. Rule '{condition.get('name','<unknown>')}' has an error.")
+                return False
+            else:
+                print(f"  Checking tag (non-boolean): {cond_value}")
+                if labels is None or service is None:
+                    return False
+                tag_label_id = get_or_create_label(service, cond_value)
+                if tag_label_id not in labels:
+                    return False
+
+        elif cond_type == 'attachment':
+            if cond_value in ["true", "false", ""]:
+                try:
+                    cond_bool = parse_bool_field(cond_value, rule_name=condition.get('name','<unknown>'), field_name="attachment condition")
+                except ValueError as e:
+                    print(e)
+                    return False
+                attachments_exist = bool(attachments)
+                print(f"  Checking attachment boolean: expected {cond_bool}, attachments exist: {attachments_exist}")
+                if cond_bool != attachments_exist:
+                    return False
+            else:
+                attachments_str = ' '.join(attachments).lower() if attachments else ''
+                if cond_value.lower() not in attachments_str:
+                    return False
+
+        elif cond_type == 'replies':
+            # New condition: replies condition in the form ">{integer}" or "<{integer}"
+            m = re.match(r'^([<>])\s*(\d+)$', cond_value)
+            if not m:
+                print(f"  Invalid format for replies condition: {cond_value}")
+                return False
+            op, num_str = m.groups()
+            required_count = int(num_str)
+            print(f"  Checking replies: operator '{op}', required count {required_count}, actual replies {replies_count}")
+            if op == '>' and not (replies_count > required_count):
+                print(f"  Replies condition failed: {replies_count} is not > {required_count}")
+                return False
+            elif op == '<' and not (replies_count < required_count):
+                print(f"  Replies condition failed: {replies_count} is not < {required_count}")
+                return False
+
+        else:
+            field_value = subject_lower
+            print(f"  Unknown cond_type '{cond_type}', defaulting to subject: {field_value}")
+            if cond_value.startswith('[') and cond_value.endswith(']'):
+                expression = cond_value[1:-1]
+                result = evaluate_logical_expression(expression, field_value)
+                print(f"  Expression: {expression}, result: {result}")
+                if not result:
+                    return False
+            else:
+                if cond_value not in field_value:
+                    return False
+
+        print("  Condition passed.")
+    print("All conditions passed.")
+    return True
+
+
+def evaluate_logical_expression(expression, text):
+    """
+    Evaluate a logical expression (supports AND, OR, XOR, NOT, and parentheses)
+    on the given text. This function assumes that the expression is provided without
+    the enclosing square brackets (i.e. user wrote ["foo" and "bar"], we receive
+    '"foo" and "bar"' here).
+    """
+
+    # Trim surrounding whitespace
+    expression = expression.strip()
+
+    def strip_outer_parens(expr):
+        """
+        If the entire expr is enclosed in matching parentheses, strip them
+        and return the inside. Otherwise, return expr unchanged.
+        """
+        expr = expr.strip()
+        if len(expr) < 2:
+            return expr
+        
+        # Must start with '(' and end with ')'
+        if not (expr.startswith('(') and expr.endswith(')')):
+            return expr
+        
+        # Check if the first '(' matches the final ')'
+        paren_count = 0
+        for i, ch in enumerate(expr):
+            if ch == '(':
+                paren_count += 1
+            elif ch == ')':
+                paren_count -= 1
+                # If paren_count hits 0 before the end, they're not wrapping the whole expr
+                if paren_count == 0 and i < len(expr) - 1:
+                    return expr
+        # If we got here, the outer parentheses do wrap the entire expression
+        return expr[1:-1].strip()
+
+    def parse_expr(expr):
+        expr = expr.strip()
+        
+        # 1) Strip outer parentheses if they truly enclose the entire subexpression
+        old_expr = expr
+        new_expr = strip_outer_parens(expr)
+        while new_expr != expr:
+            expr = new_expr
+            new_expr = strip_outer_parens(expr)
+
+        # 2) Handle leading NOT operator
+        #    e.g. "not (foo or bar)" => not <subexpression>
+        #    e.g. "not foo" => not <keyword>
+        if expr.startswith('not '):
+            return not parse_expr(expr[4:].strip())
+
+        # 3) Scan for top-level operators (AND, OR, XOR) outside parentheses/quotes
+        in_quotes = False
+        paren_level = 0
+        op_index = None
+        op_found = None
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif not in_quotes:
+                if ch == '(':
+                    paren_level += 1
+                elif ch == ')':
+                    paren_level -= 1
+                # Only check for operators at top level (paren_level == 0)
+                if paren_level == 0:
+                    # Check for multi-char operators with surrounding spaces
+                    for op in [' and ', ' or ', ' xor ']:
+                        if expr[i:].startswith(op):
+                            op_index = i
+                            op_found = op.strip()  # 'and', 'or', or 'xor'
+                            break
+                    if op_found:
+                        break
+            i += 1
+
+        if op_found:
+            # We found a top-level operator at op_index
+            left_str = expr[:op_index]
+            # The operator has length len(op_found) + 2 spaces = e.g. ' and ' => 5 chars
+            op_len = len(op_found) + 2  # e.g. ' and ' is 5 chars
+            right_str = expr[op_index + op_len:]
+
+            left_val = parse_expr(left_str)
+            right_val = parse_expr(right_str)
+
+            if op_found == 'and':
+                return left_val and right_val
+            elif op_found == 'or':
+                return left_val or right_val
+            elif op_found == 'xor':
+                return bool(left_val) != bool(right_val)
+
+        # 4) No top-level operator found => treat as a simple keyword search
+        #    Remove any leading/trailing quotes
+        keyword = expr.strip().strip('"\'')
+        return keyword in text
+
+    # Kick off parsing
+    return parse_expr(expression)
+
+def get_or_create_label(service, label_name):
+    """Get existing label ID or create a new one."""
+    try:
+        results = service.users().labels().list(userId='me').execute()
+        labels = results.get('labels', [])
+        for label in labels:
+            if label['name'].lower() == label_name.lower():
+                return label['id']
+        # Create new label if not found.
+        new_label = {
+            'name': label_name,
+            'labelListVisibility': 'labelShow',
+            'messageListVisibility': 'show'
+        }
+        created = service.users().labels().create(userId='me', body=new_label).execute()
+        return created['id']
+    except Exception as e:
+        print(f"Error handling labels: {e}")
+        return None
+
+
+def handle_rule_action(service, message_id, rule):
+    """Execute the action specified in the rule."""
+    action = rule['action']
+    action_value = rule['action_value']
+    rule_name = rule.get('name', 'Unknown Rule')
+
+    if not action or action.lower() == 'none':
+        print("No action specified")
+        return
+
+    action_lower = action.lower()
+
+    try:
+        if action_lower in ['mark_important', 'star', 'archive', 'delete']:
+            action_bool = parse_bool_field(action_value, rule_name, f"action {action_lower}")
+    except ValueError as e:
+        print(e)
+        return
+
+    try:
+        if action_lower == 'mark_important':
+            if action_bool:
+                service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={
+                        'addLabelIds': ['IMPORTANT'],
+                        'removeLabelIds': []
+                    }
+                ).execute()
+                print(f"Marked email as important (Rule: {rule_name})")
+            else:
+                service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={
+                        'addLabelIds': [],
+                        'removeLabelIds': ['IMPORTANT']
+                    }
+                ).execute()
+                print(f"Marked email as not important (Rule: {rule_name})")
+
+        elif action_lower == 'star':
+            if action_bool:
+                service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={
+                        'addLabelIds': ['STARRED'],
+                        'removeLabelIds': []
+                    }
+                ).execute()
+                print(f"Starred email (Rule: {rule_name})")
+            else:
+                service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={
+                        'addLabelIds': [],
+                        'removeLabelIds': ['STARRED']
+                    }
+                ).execute()
+                print(f"Unstarred email (Rule: {rule_name})")
+
+        elif action_lower == 'archive':
+            if action_bool:
+                service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={'removeLabelIds': ['INBOX']}
+                ).execute()
+                print(f"Archived email (Rule: {rule_name})")
+            else:
+                print(f"Archive action set to False; no action taken (Rule: {rule_name})")
+
+        elif action_lower == 'delete':
+            if action_bool:
+                service.users().messages().trash(userId='me', id=message_id).execute()
+                print(f"Deleted email (Rule: {rule_name})")
+            else:
+                print(f"Delete action set to False; no action taken (Rule: {rule_name})")
+
+        elif action_lower == 'move':
+            label_id = get_or_create_label(service, action_value)
+            if label_id:
+                # Check if the rule targets the tag "Algorithm Reviewed [Pending]"
+                pending_targeted = any(
+                    cond['type'].lower() == 'tag' and cond['value'].strip().lower() == 'algorithm reviewed [pending]'
+                    for cond in rule.get('conditions', [])
+                )
+                if pending_targeted:
+                    # Retrieve the pending and reviewed tag IDs.
+                    pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
+                    reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
+                    service.users().messages().modify(
+                        userId='me',
+                        id=message_id,
+                        body={
+                            'addLabelIds': [label_id, reviewed_label_id],
+                            'removeLabelIds': ['INBOX', pending_label_id]
+                        }
+                    ).execute()
+                    print(f"Moved email to: {action_value} and replaced 'Algorithm Reviewed [Pending]' with 'Algorithm Reviewed' (Rule: {rule_name})")
+                else:
+                    service.users().messages().modify(
+                        userId='me',
+                        id=message_id,
+                        body={
+                            'addLabelIds': [label_id],
+                            'removeLabelIds': ['INBOX']
+                        }
+                    ).execute()
+                    print(f"Moved email to: {action_value} (Rule: {rule_name})")
+                    
+        else:
+            if action_lower == 'label':
+                label_id = get_or_create_label(service, action_value)
+                if label_id:
+                    service.users().messages().modify(
+                        userId='me',
+                        id=message_id,
+                        body={'addLabelIds': [label_id]}
+                    ).execute()
+                    print(f"Applied label: {action_value} (Rule: {rule_name})")
+    except Exception as e:
+        print(f"Error performing action {action} for rule {rule_name}: {str(e)}")
+
+
+def extract_attachments(msg):
+    """Extract a list of attachment filenames from the email message payload."""
+    attachments = []
+    payload = msg.get('payload', {})
+    if 'parts' in payload:
+        for part in payload['parts']:
+            filename = part.get('filename')
+            if filename:
+                attachments.append(filename)
+    return attachments
+
+
+def process_emails(rule_sheet=None):
+    print("\n=== Starting Email Processing ===")
+    
+    service = get_gmail_service()
+    # Pass the sheet name into the rule loading function.
+    rules = load_rules_from_excel('resources/rules.xlsx', sheet_name=rule_sheet)
+    print(f"Loaded {len(rules)} rules from Excel")
+    
+    algorithm_reviewed_label = get_or_create_label(service, 'Algorithm Reviewed')
+    pending_label = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
+    
+    query = 'in:inbox category:primary -label:"Algorithm Reviewed"'
+    results = service.users().messages().list(userId='me', q=query).execute()
+    messages = results.get('messages', [])
+    
+    if not messages:
+        print("No new emails to process")
+        return
+    
+    # Process newest emails first (or adjust query as needed)
+    messages.reverse()
+    
+    total_messages = len(messages)
+    print(f"Found {total_messages} emails to check")
+    
+    rules_applied_count = 0
+    
+    for index, message in enumerate(messages, 1):
+        print(f"\nProcessing email {index}/{total_messages}")
+        msg = service.users().messages().get(userId='me', id=message['id'], format='full').execute()
+        headers = msg['payload'].get('headers', [])
+        
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+        date_str = next((h['value'] for h in headers if h['name'] == 'Date'), None)
+        email_date = parsedate_to_datetime(date_str) if date_str else datetime.now()
+        body = msg.get('snippet', '')
+        attachments = extract_attachments(msg)
+        
+        msg_labels = msg.get('labelIds', [])
+        is_important = 'IMPORTANT' in msg_labels
+
+        # Retrieve thread replies count.
+        thread_id = msg.get('threadId')
+        if thread_id:
+            thread = service.users().threads().get(userId='me', id=thread_id).execute()
+            replies_count = len(thread.get('messages', [])) - 1
+        else:
+            replies_count = 0
+        
+        pending_exists = pending_label in msg_labels
+        if pending_exists:
+            print("Email has 'Algorithm Reviewed [Pending]' label, only specific rules will be applied")
+        
+        rule_applied = False
+        for rule_index, rule in enumerate(rules, 1):
+            print(f"Checking rule {rule_index}: {rule['name']}")
+            
+            if pending_exists:
+                has_pending_condition = any(
+                    c['type'].lower() == 'tag' and c['value'].lower() == 'algorithm reviewed [pending]'
+                    for c in rule['conditions']
+                )
+                if not has_pending_condition:
+                    print("  Skipping rule - email has pending label but rule doesn't look for it")
+                    continue
+            
+            if evaluate_conditions(rule['conditions'], subject, sender, body, email_date, msg_labels, service, is_important, attachments, replies_count):
+                print(f"✓ Rule '{rule['name']}' matched!")
+                handle_rule_action(service, message['id'], rule)
+                rule_applied = True
+                rules_applied_count += 1
+
+                if algorithm_reviewed_label not in msg_labels and pending_label not in msg_labels:
+                    service.users().messages().modify(
+                        userId='me',
+                        id=message['id'],
+                        body={'addLabelIds': [algorithm_reviewed_label]}
+                    ).execute()
+                    print("Added 'Algorithm Reviewed' label")
+                else:
+                    print("Skipped adding 'Algorithm Reviewed' label because one already exists")
+                break
+            else:
+                print(f"✗ Rule '{rule['name']}' did not match")
+        
+        if not rule_applied:
+            print("No rules matched for this email")
+    
+    print("\n=== Email Processing Complete ===")
+    print(f"Applied rules to {rules_applied_count} emails")
+
+if __name__ == "__main__":
+    # MainSheet ClearanceRules
+    rule_sheet = "MainSheet"
+    process_emails(rule_sheet=rule_sheet)
+    print("Email processing complete!")
