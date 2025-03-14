@@ -8,6 +8,7 @@ import os
 import base64
 from googleapiclient.discovery import build
 import openpyxl
+import subprocess
 
 # Gmail API Scopes (adjust as needed)
 SCOPES = [
@@ -122,85 +123,99 @@ def load_rules_from_excel(file_path, sheet_name=None):
                     'value': str(cond_value).lower()
                 })
         
-        print(f"Loaded rule: {rule['name']}")
-        print(f"  Rule Type: {rule['rule_type']}")
-        print(f"  Conditions: {len(rule['conditions'])}")
-        print(f"  Action: {rule['action']} -> {rule['action_value']}")
+        # print(f"Loaded rule: {rule['name']}")
+        # print(f"  Rule Type: {rule['rule_type']}")
+        # print(f"  Conditions: {len(rule['conditions'])}")
+        # print(f"  Action: {rule['action']} -> {rule['action_value']}")
         rules.append(rule)
     
+    print("\n=== Rules Loaded from Excel ===")
+    for idx, rule in enumerate(rules, start=1):
+        print(f"Rule {idx}:")
+        print(f"  Name: {rule['name']}")
+        # print(f"  Rule Type: {rule['rule_type']}")
+        # print(f"  Conditions:")
+        # for c_idx, cond in enumerate(rule['conditions'], start=1):
+        #     print(f"    Condition {c_idx}: type='{cond['type']}', value='{cond['value']}'")
+        # print(f"  Action: {rule['action']}")
+        # print(f"  Action Value: {rule['action_value']}")
+    print("================================\n")
+
     return rules
+
+def get_full_body_text(payload):
+    """
+    Recursively extract all text (text/plain or text/html) from the message payload,
+    decode from base64, and return as a single string.
+    """
+    parts_text = []
+
+    def walk(part):
+        mime_type = part.get('mimeType', '')
+        # If this part has sub-parts, walk them recursively
+        if 'parts' in part:
+            for p in part['parts']:
+                walk(p)
+        else:
+            body = part.get('body', {})
+            data = body.get('data')
+            # Only decode if there's actual data and the MIME type is text
+            if data and ('text/plain' in mime_type or 'text/html' in mime_type):
+                decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')
+                parts_text.append(decoded)
+
+    walk(payload)
+    # Combine all text parts with a newline
+    return "\n".join(parts_text)
 
 def evaluate_conditions(conditions, subject, sender, body, email_date, labels, service, is_important=False, attachments=None, replies_count=0):
     subject_lower = subject.lower() if subject else ''
     sender_lower = sender.lower() if sender else ''
     body_lower = body.lower() if body else ''
 
-    print("\n--- evaluate_conditions ---")
-    print(f"Subject: {subject_lower}")
-    print(f"Sender: {sender_lower}")
-    print(f"Body snippet: {body_lower[:50]}...")
-    print(f"Labels: {labels}")
-    print(f"Is Important?: {is_important}")
-    print(f"Attachments: {attachments}")
-    print(f"Replies Count: {replies_count}")
+    # (Debug prints removed here so that they don’t run for each rule)
 
     for idx, condition in enumerate(conditions, 1):
         cond_type = condition['type'].lower()
         cond_value = condition['value'].strip()
 
-        print(f"\nCondition {idx}:")
-        print(f"  Type: {cond_type}")
-        print(f"  Value (raw): {condition['value']}")
-        print(f"  Value (processed): {cond_value}")
-
         if cond_type == 'none':
-            print("  Condition type is 'none'; skipping.")
             continue
 
         if cond_type == 'sender':
             field_value = sender_lower
-            print(f"  Checking sender against: {field_value}")
             if cond_value.startswith('[') and cond_value.endswith(']'):
                 expression = cond_value[1:-1]
                 result = evaluate_logical_expression(expression, field_value)
-                print(f"  Expression: {expression}, result: {result}")
                 if not result:
                     return False
             else:
                 if cond_value not in field_value:
-                    print("  Substring not found in sender -> condition fails.")
                     return False
 
         elif cond_type == 'subject':
             field_value = subject_lower
-            print(f"  Checking subject against: {field_value}")
             if cond_value.startswith('[') and cond_value.endswith(']'):
                 expression = cond_value[1:-1]
                 result = evaluate_logical_expression(expression, field_value)
-                print(f"  Expression: {expression}, result: {result}")
                 if not result:
                     return False
             else:
                 if cond_value not in field_value:
-                    print("  Substring not found in subject -> condition fails.")
                     return False
 
         elif cond_type == 'body':
             field_value = body_lower
-            print(f"  Checking body against: {field_value[:50]}...")
             if cond_value.startswith('[') and cond_value.endswith(']'):
                 expression = cond_value[1:-1]
                 result = evaluate_logical_expression(expression, field_value)
-                print(f"  Expression: {expression}, result: {result}")
                 if not result:
                     return False
             else:
                 if cond_value not in field_value:
-                    print("  Substring not found in body -> condition fails.")
                     return False
 
         elif cond_type == 'date':
-            print(f"  Checking date: {email_date}")
             m = re.match(r'^\[\s*(<|<=|>|>=|==)\s*([\d]{4}-[\d]{2}-[\d]{2})\s*\]$', cond_value)
             if m:
                 op, cond_date_str = m.groups()
@@ -225,9 +240,7 @@ def evaluate_conditions(conditions, subject, sender, body, email_date, labels, s
             except ValueError as e:
                 print(e)
                 return False
-            actual_bool = is_important
-            print(f"  Checking important: expected {cond_bool}, actual {actual_bool}")
-            if cond_bool != actual_bool:
+            if cond_bool != is_important:
                 return False
 
         elif cond_type == 'tag':
@@ -237,10 +250,9 @@ def evaluate_conditions(conditions, subject, sender, body, email_date, labels, s
                 except ValueError as e:
                     print(e)
                     return False
-                print(f"  Error: Boolean tag conditions are not supported. Rule '{condition.get('name','<unknown>')}' has an error.")
+                print(f"Error: Boolean tag conditions are not supported (Rule '{condition.get('name','<unknown>')}')")
                 return False
             else:
-                print(f"  Checking tag (non-boolean): {cond_value}")
                 if labels is None or service is None:
                     return False
                 tag_label_id = get_or_create_label(service, cond_value)
@@ -255,7 +267,6 @@ def evaluate_conditions(conditions, subject, sender, body, email_date, labels, s
                     print(e)
                     return False
                 attachments_exist = bool(attachments)
-                print(f"  Checking attachment boolean: expected {cond_bool}, attachments exist: {attachments_exist}")
                 if cond_bool != attachments_exist:
                     return False
             else:
@@ -264,36 +275,28 @@ def evaluate_conditions(conditions, subject, sender, body, email_date, labels, s
                     return False
 
         elif cond_type == 'replies':
-            # New condition: replies condition in the form ">{integer}" or "<{integer}"
             m = re.match(r'^([<>])\s*(\d+)$', cond_value)
             if not m:
-                print(f"  Invalid format for replies condition: {cond_value}")
+                print(f"Invalid format for replies condition: {cond_value}")
                 return False
             op, num_str = m.groups()
             required_count = int(num_str)
-            print(f"  Checking replies: operator '{op}', required count {required_count}, actual replies {replies_count}")
             if op == '>' and not (replies_count > required_count):
-                print(f"  Replies condition failed: {replies_count} is not > {required_count}")
                 return False
             elif op == '<' and not (replies_count < required_count):
-                print(f"  Replies condition failed: {replies_count} is not < {required_count}")
                 return False
 
         else:
             field_value = subject_lower
-            print(f"  Unknown cond_type '{cond_type}', defaulting to subject: {field_value}")
             if cond_value.startswith('[') and cond_value.endswith(']'):
                 expression = cond_value[1:-1]
                 result = evaluate_logical_expression(expression, field_value)
-                print(f"  Expression: {expression}, result: {result}")
                 if not result:
                     return False
             else:
                 if cond_value not in field_value:
                     return False
 
-        print("  Condition passed.")
-    print("All conditions passed.")
     return True
 
 
@@ -307,6 +310,9 @@ def evaluate_logical_expression(expression, text):
 
     # Trim surrounding whitespace
     expression = expression.strip()
+
+    expression = re.sub(r'[\r\n]+', ' ', expression)
+    expression = re.sub(r'\s+', ' ', expression)
 
     def strip_outer_parens(expr):
         """
@@ -567,7 +573,6 @@ def process_emails(rule_sheet=None):
     print("\n=== Starting Email Processing ===")
     
     service = get_gmail_service()
-    # Pass the sheet name into the rule loading function.
     rules = load_rules_from_excel('resources/rules.xlsx', sheet_name=rule_sheet)
     print(f"Loaded {len(rules)} rules from Excel")
     
@@ -582,9 +587,6 @@ def process_emails(rule_sheet=None):
         print("No new emails to process")
         return
     
-    # Process newest emails first (or adjust query as needed)
-    messages.reverse()
-    
     total_messages = len(messages)
     print(f"Found {total_messages} emails to check")
     
@@ -594,18 +596,23 @@ def process_emails(rule_sheet=None):
         print(f"\nProcessing email {index}/{total_messages}")
         msg = service.users().messages().get(userId='me', id=message['id'], format='full').execute()
         headers = msg['payload'].get('headers', [])
-        
+
+        # Extract some basic header info
         subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
         sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
         date_str = next((h['value'] for h in headers if h['name'] == 'Date'), None)
         email_date = parsedate_to_datetime(date_str) if date_str else datetime.now()
-        body = msg.get('snippet', '')
+
+        # Get the full message body (instead of the snippet)
+        full_body = get_full_body_text(msg.get('payload', {}))
+
+        # Extract attachments
         attachments = extract_attachments(msg)
         
         msg_labels = msg.get('labelIds', [])
         is_important = 'IMPORTANT' in msg_labels
 
-        # Retrieve thread replies count.
+        # Count replies
         thread_id = msg.get('threadId')
         if thread_id:
             thread = service.users().threads().get(userId='me', id=thread_id).execute()
@@ -613,30 +620,48 @@ def process_emails(rule_sheet=None):
         else:
             replies_count = 0
         
+        print("\n--- Email Debug Info ---")
+        print(f"Subject: {subject}")
+        print(f"Sender: {sender}")
+        # print(f"Body excerpt: {full_body[:100]}...")
+        # print(f"Labels: {msg_labels}")
+        # print(f"Is Important?: {is_important}")
+        # print(f"Attachments: {attachments}")
+        # print(f"Replies Count: {replies_count}")
+        
         pending_exists = pending_label in msg_labels
         if pending_exists:
-            print("Email has 'Algorithm Reviewed [Pending]' label, only specific rules will be applied")
+            print("Email has 'Algorithm Reviewed [Pending]' label; only specific rules will be applied")
         
         rule_applied = False
         for rule_index, rule in enumerate(rules, 1):
-            print(f"Checking rule {rule_index}: {rule['name']}")
-            
+            if rule.get('rule_type') == 'paused':
+                # print(f"  Skipping rule '{rule['name']}' because it is paused")
+                continue
+
+            # print(f"Checking rule {rule_index}: {rule['name']}")
             if pending_exists:
                 has_pending_condition = any(
                     c['type'].lower() == 'tag' and c['value'].lower() == 'algorithm reviewed [pending]'
                     for c in rule['conditions']
                 )
                 if not has_pending_condition:
-                    print("  Skipping rule - email has pending label but rule doesn't look for it")
+                    # print("  Skipping rule - email has pending label but rule doesn't look for it")
                     continue
-            
-            if evaluate_conditions(rule['conditions'], subject, sender, body, email_date, msg_labels, service, is_important, attachments, replies_count):
+
+            # Evaluate conditions using the full body text
+            if evaluate_conditions(rule['conditions'], subject, sender, full_body,
+                                   email_date, msg_labels, service, is_important,
+                                   attachments, replies_count):
                 print(f"✓ Rule '{rule['name']}' matched!")
                 handle_rule_action(service, message['id'], rule)
                 rule_applied = True
                 rules_applied_count += 1
 
-                if algorithm_reviewed_label not in msg_labels and pending_label not in msg_labels:
+                # Refresh message labels after action
+                updated_msg = service.users().messages().get(userId='me', id=message['id'], format='metadata').execute()
+                updated_labels = updated_msg.get('labelIds', [])
+                if algorithm_reviewed_label not in updated_labels and pending_label not in updated_labels:
                     service.users().messages().modify(
                         userId='me',
                         id=message['id'],
@@ -646,17 +671,81 @@ def process_emails(rule_sheet=None):
                 else:
                     print("Skipped adding 'Algorithm Reviewed' label because one already exists")
                 break
-            else:
-                print(f"✗ Rule '{rule['name']}' did not match")
+            # else:
+            #     print(f"✗ Rule '{rule['name']}' did not match")
         
         if not rule_applied:
             print("No rules matched for this email")
     
     print("\n=== Email Processing Complete ===")
-    print(f"Applied rules to {rules_applied_count} emails")
+    print(f"Applied rules to {rules_applied_count} / {total_messages} emails")
+    return rules_applied_count
+
+
+def run_maintenance():
+    """
+    Runs the main sheet once (maintenance).
+    """
+    print("=== MAINTENANCE ROUTINE START ===")
+    processed = process_emails(rule_sheet="MainSheet")
+    print(f"MAINTENANCE DONE. Emails processed: {processed}\n")
+
+
+def run_clearance(): 
+    """
+    Runs the clearance sheet once (for debugging).
+    """
+    print("=== CLEARANCE ROUTINE START ===")
+    processed = process_emails(rule_sheet="ClearanceRules")
+    print(f"CLEARANCE DONE. Emails processed: {processed}\n")
+
+def run_cleaning():
+    """
+    Runs the cleaning routine in a loop:
+      1) Run main sheet
+         - If it processed > 0 emails, repeat (stay in loop).
+         - If it processed 0 emails, run clearance sheet once.
+           * If clearance sheet also processes 0, then end cleaning.
+           * Otherwise, repeat the loop.
+    """
+    print("=== CLEANING ROUTINE START ===")
+    while True:
+        main_processed = process_emails(rule_sheet="MainSheet")
+        if main_processed == 0:
+            # Switch to clearance
+            clearance_processed = process_emails(rule_sheet="ClearanceRules")
+            if clearance_processed < 20:
+                # Both main & clearance processed 0 => done
+                print("CLEANING DONE: No more emails to process.")
+                break
+            else:
+                # Clearance did something => keep cleaning
+                print("Cleared some emails. Continuing cleaning routine...\n")
+        else:
+            # Main sheet processed > 0 => keep looping
+            print("Main sheet processed some emails. Continuing cleaning routine...\n")
+
+    print("=== CLEANING ROUTINE END ===")
+
+def notify(title, message):
+    subprocess.run([
+        'terminal-notifier',
+        '-title', title,
+        '-message', message,
+        '-sound', 'Ping'  # Optional sound
+    ])
+
 
 if __name__ == "__main__":
-    # MainSheet ClearanceRules
-    rule_sheet = "MainSheet"
-    process_emails(rule_sheet=rule_sheet)
-    print("Email processing complete!")
+    # 1) Maintenance
+    # run_maintenance()
+
+    # 2) Cleaning
+    run_cleaning()
+
+    # Debugging
+    # run_clearance()
+
+    notify("Email Cleaning", "Email cleaning process done!")
+    print("All routines finished.")
+    
