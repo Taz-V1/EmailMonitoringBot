@@ -99,7 +99,7 @@ def load_rules_from_excel(file_path, sheet_name=None):
 
     for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):  # Skip header
         rule_type = row[3]
-        if not rule_type or (isinstance(rule_type, str) and rule_type.lower() == 'none'):
+        if not rule_type or (isinstance(rule_type, str) and (rule_type.lower() == 'none' or rule_type.lower() == 'paused')):
             continue
 
         rule = {
@@ -569,57 +569,96 @@ def extract_attachments(msg):
     return attachments
 
 
-def process_emails(rule_sheet=None):
-    print("\n=== Starting Email Processing ===")
-    
+def clear_failed_to_review():
+    """
+    Removes 'Algorithm Failed to Review' label from all emails in the inbox.
+    (In case you decide to re-run them or simply want to unmark them.)
+    """
     service = get_gmail_service()
-    rules = load_rules_from_excel('resources/rules.xlsx', sheet_name=rule_sheet)
-    print(f"Loaded {len(rules)} rules from Excel")
-    
-    algorithm_reviewed_label = get_or_create_label(service, 'Algorithm Reviewed')
-    pending_label = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
-    
-    query = 'in:inbox category:primary -label:"Algorithm Reviewed"'
+    failed_label = get_or_create_label(service, 'Algorithm Failed to Review')
+    if not failed_label:
+        print("No 'Algorithm Failed to Review' label found or created.")
+        return
+
+    # Query all inbox emails that have the label "Algorithm Failed to Review"
+    query = 'in:inbox label:"Algorithm Failed to Review"'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
-    
+
     if not messages:
-        print("No new emails to process")
+        print("No emails with 'Algorithm Failed to Review' found in inbox.")
         return
+
+    for msg_info in messages:
+        msg_id = msg_info['id']
+        service.users().messages().modify(
+            userId='me',
+            id=msg_id,
+            body={'removeLabelIds': [failed_label]}
+        ).execute()
+
+    print("All 'Algorithm Failed to Review' labels removed from inbox emails.")
+
+
+def process_emails_main():
+    """
+    MAIN Routine:
+      - Queries only emails that are unreviewed (i.e. not labeled as "Algorithm Reviewed",
+        "Algorithm Reviewing [Clearance]", or "Algorithm Failed to Review").
+      - Evaluates main rules; if a rule matches, the email is processed and labeled
+        "Algorithm Reviewed". If no rule matches, the email is labeled "Algorithm Reviewing [Clearance]".
+    """
+    print("\n=== Starting MAIN Processing ===")
+    service = get_gmail_service()
+    main_rules = load_rules_from_excel('resources/rules.xlsx', sheet_name="MainSheet")
+    print(f"Loaded {len(main_rules)} main rules from Excel")
+    
+    reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
+    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewing [Clearance]')
+    failed_review_id = get_or_create_label(service, 'Algorithm Failed to Review')
+    pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
+    
+    query = (
+        'in:inbox category:primary '
+        f'-label:"{reviewed_label_id}" '
+        f'-label:"{reviewing_clearance_id}" '
+        f'-label:"{failed_review_id}"'
+    )
+    results = service.users().messages().list(userId='me', q=query).execute()
+    messages = results.get('messages', [])
+
+    if not messages:
+        print("No new emails for MAIN to process")
+        return 0
     
     total_messages = len(messages)
-    print(f"Found {total_messages} emails to check")
+    print(f"Found {total_messages} emails to check (MAIN)")
     
     rules_applied_count = 0
-    
-    for index, message in enumerate(messages, 1):
-        print(f"\nProcessing email {index}/{total_messages}")
-        msg = service.users().messages().get(userId='me', id=message['id'], format='full').execute()
-        headers = msg['payload'].get('headers', [])
 
-        # Extract some basic header info
+    for index, msg_info in enumerate(messages, 1):
+        msg_id = msg_info['id']
+        print(f"\nMAIN: Processing email {index}/{total_messages} (ID: {msg_id})")
+        msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+
+
+        headers = msg['payload'].get('headers', [])
         subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
         sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
         date_str = next((h['value'] for h in headers if h['name'] == 'Date'), None)
         email_date = parsedate_to_datetime(date_str) if date_str else datetime.now()
-
-        # Get the full message body (instead of the snippet)
         full_body = get_full_body_text(msg.get('payload', {}))
-
-        # Extract attachments
         attachments = extract_attachments(msg)
-        
         msg_labels = msg.get('labelIds', [])
         is_important = 'IMPORTANT' in msg_labels
-
-        # Count replies
+        replies_count = 0
         thread_id = msg.get('threadId')
         if thread_id:
             thread = service.users().threads().get(userId='me', id=thread_id).execute()
             replies_count = len(thread.get('messages', [])) - 1
         else:
             replies_count = 0
-        
+
         print("\n--- Email Debug Info ---")
         print(f"Subject: {subject}")
         print(f"Sender: {sender}")
@@ -628,124 +667,244 @@ def process_emails(rule_sheet=None):
         # print(f"Is Important?: {is_important}")
         # print(f"Attachments: {attachments}")
         # print(f"Replies Count: {replies_count}")
-        
-        pending_exists = pending_label in msg_labels
+
+        pending_exists = pending_label_id in msg_labels
         if pending_exists:
             print("Email has 'Algorithm Reviewed [Pending]' label; only specific rules will be applied")
         
-        rule_applied = False
-        for rule_index, rule in enumerate(rules, 1):
-            if rule.get('rule_type') == 'paused':
-                # print(f"  Skipping rule '{rule['name']}' because it is paused")
-                continue
-
-            # print(f"Checking rule {rule_index}: {rule['name']}")
+        rule_matched = False
+        for rule in main_rules:
+            # if rule.get('rule_type') == 'paused':
+            #     continue
             if pending_exists:
                 has_pending_condition = any(
                     c['type'].lower() == 'tag' and c['value'].lower() == 'algorithm reviewed [pending]'
                     for c in rule['conditions']
                 )
                 if not has_pending_condition:
-                    # print("  Skipping rule - email has pending label but rule doesn't look for it")
                     continue
 
-            # Evaluate conditions using the full body text
+            
             if evaluate_conditions(rule['conditions'], subject, sender, full_body,
                                    email_date, msg_labels, service, is_important,
                                    attachments, replies_count):
-                print(f"✓ Rule '{rule['name']}' matched!")
-                handle_rule_action(service, message['id'], rule)
-                rule_applied = True
+                print(f"✓ MAIN Rule '{rule['name']}' matched!")
+                handle_rule_action(service, msg_id, rule)
+                rule_matched = True
                 rules_applied_count += 1
 
-                # Refresh message labels after action
-                updated_msg = service.users().messages().get(userId='me', id=message['id'], format='metadata').execute()
+
+                updated_msg = service.users().messages().get(userId='me', id=msg_id, format='metadata').execute()
                 updated_labels = updated_msg.get('labelIds', [])
-                if algorithm_reviewed_label not in updated_labels and pending_label not in updated_labels:
+                if reviewed_label_id not in updated_labels and pending_label_id not in updated_labels:
                     service.users().messages().modify(
                         userId='me',
-                        id=message['id'],
-                        body={'addLabelIds': [algorithm_reviewed_label]}
+                        id=msg_id,
+                        body={'addLabelIds': [reviewed_label_id]}
                     ).execute()
-                    print("Added 'Algorithm Reviewed' label")
+                    print("Added 'Algorithm Reviewed' label (Main process).")
                 else:
-                    print("Skipped adding 'Algorithm Reviewed' label because one already exists")
+                    print("Skipped adding 'Algorithm Reviewed' label because one already exists.")
                 break
             # else:
             #     print(f"✗ Rule '{rule['name']}' did not match")
-        
-        if not rule_applied:
-            print("No rules matched for this email")
-    
-    print("\n=== Email Processing Complete ===")
-    print(f"Applied rules to {rules_applied_count} / {total_messages} emails")
+
+        if not rule_matched:
+            print("No MAIN rule matched; labeling 'Algorithm Reviewing [Clearance]'")
+            service.users().messages().modify(
+                userId='me',
+                id=msg_id,
+                body={'addLabelIds': [reviewing_clearance_id]}
+            ).execute()
+
+            
+    print(f"\n=== MAIN Processing Complete ===")
+    print(f"Applied rules to {rules_applied_count} / {total_messages} emails (Main process)")
     return rules_applied_count
 
 
-def run_maintenance():
+def process_emails_clearance():
     """
-    Runs the main sheet once (maintenance).
+    CLEARANCE Routine:
+      - Processes only emails labeled "Algorithm Reviewing [Clearance]".
+      - For each email, runs clearance rules.
+      - If a rule matches, handles the action, re-fetches metadata, and if the email still
+        has "Algorithm Reviewing [Clearance]" (and lacks "Algorithm Reviewed"), removes the former
+        and adds "Algorithm Reviewed".
+      - If no clearance rule matches, removes "Algorithm Reviewing [Clearance]" and adds "Algorithm Failed to Review".
     """
-    print("=== MAINTENANCE ROUTINE START ===")
-    processed = process_emails(rule_sheet="MainSheet")
-    print(f"MAINTENANCE DONE. Emails processed: {processed}\n")
+    print("\n=== Starting CLEARANCE Processing ===")
+    service = get_gmail_service()
+    clearance_rules = load_rules_from_excel('resources/rules.xlsx', sheet_name="ClearanceRules")
+    print(f"Loaded {len(clearance_rules)} clearance rules from Excel")
+    
+    reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
+    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewing [Clearance]')
+    failed_review_id = get_or_create_label(service, 'Algorithm Failed to Review')
+    pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
+    
+    query = f'in:inbox label:"{reviewing_clearance_id}"'
+    results = service.users().messages().list(userId='me', q=query).execute()
+    messages = results.get('messages', [])
+
+    if not messages:
+        print("No emails for CLEARANCE to process")
+        return 0
+    
+    total_messages = len(messages)
+    print(f"Found {total_messages} emails to check (CLEARANCE)")
+    
+    rules_applied_count = 0
+    
+    for index, msg_info in enumerate(messages, 1):
+        msg_id = msg_info['id']
+        print(f"\nCLEARANCE: Processing email {index}/{total_messages} (ID: {msg_id})")
+        msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
 
 
-def run_clearance(): 
-    """
-    Runs the clearance sheet once (for debugging).
-    """
-    print("=== CLEARANCE ROUTINE START ===")
-    processed = process_emails(rule_sheet="ClearanceRules")
-    print(f"CLEARANCE DONE. Emails processed: {processed}\n")
+        headers = msg['payload'].get('headers', [])
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+        date_str = next((h['value'] for h in headers if h['name'] == 'Date'), None)
+        email_date = parsedate_to_datetime(date_str) if date_str else datetime.now()
+        full_body = get_full_body_text(msg.get('payload', {}))
+        attachments = extract_attachments(msg)
+        msg_labels = msg.get('labelIds', [])
+        is_important = 'IMPORTANT' in msg_labels
+        replies_count = 0
+        thread_id = msg.get('threadId')
+        if thread_id:
+            thread = service.users().threads().get(userId='me', id=thread_id).execute()
+            replies_count = len(thread.get('messages', [])) - 1
+        else:
+            replies_count = 0
+
+        print("\n--- Email Debug Info ---")
+        print(f"Subject: {subject}")
+        print(f"Sender: {sender}")
+        # print(f"Body excerpt: {full_body[:100]}...")
+        # print(f"Labels: {msg_labels}")
+        # print(f"Is Important?: {is_important}")
+        # print(f"Attachments: {attachments}")
+        # print(f"Replies Count: {replies_count}")
+
+        pending_exists = pending_label_id in msg_labels
+        if pending_exists:
+            print("Email has 'Algorithm Reviewed [Pending]' label; only specific rules will be applied")
+
+        rule_matched = False
+        for rule in clearance_rules:
+            # if rule.get('rule_type') == 'paused':
+            #     continue
+            if pending_exists:
+                has_pending_condition = any(
+                    c['type'].lower() == 'tag' and c['value'].lower() == 'algorithm reviewed [pending]'
+                    for c in rule['conditions']
+                )
+                if not has_pending_condition:
+                    continue
+
+
+            if evaluate_conditions(rule['conditions'], subject, sender, full_body,
+                                   email_date, msg_labels, service, is_important,
+                                   attachments, replies_count):
+                print(f"✓ CLEARANCE Rule '{rule['name']}' matched!")
+                handle_rule_action(service, msg_id, rule)
+                rule_matched = True
+                rules_applied_count += 1
+
+                
+                updated_msg = service.users().messages().get(userId='me', id=msg_id, format='metadata').execute()
+                updated_labels = updated_msg.get('labelIds', [])
+                if reviewing_clearance_id in updated_labels and reviewed_label_id not in updated_labels:
+                    service.users().messages().modify(
+                        userId='me',
+                        id=msg_id,
+                        body={'removeLabelIds': [reviewing_clearance_id],
+                              'addLabelIds': [reviewed_label_id]}
+                    ).execute()
+                    print("Replaced 'Algorithm Reviewing [Clearance]' with 'Algorithm Reviewed' (Clearance process).")
+                else:
+                    print("Skipped label update in Clearance process; label already updated.")
+                break
+        if not rule_matched:
+            print("No CLEARANCE rule matched; labeling 'Algorithm Failed to Review'")
+            service.users().messages().modify(
+                userId='me',
+                id=msg_id,
+                body={'removeLabelIds': [reviewing_clearance_id],
+                      'addLabelIds': [failed_review_id]}
+            ).execute()
+    print(f"\n=== CLEARANCE Processing Complete ===")
+    print(f"Applied clearance rules to {rules_applied_count} / {total_messages} emails (Clearance process)")
+    return rules_applied_count
+
 
 def run_cleaning():
     """
-    Runs the cleaning routine in a loop:
-      1) Run main sheet
-         - If it processed > 0 emails, repeat (stay in loop).
-         - If it processed 0 emails, run clearance sheet once.
-           * If clearance sheet also processes 0, then end cleaning.
-           * Otherwise, repeat the loop.
+    Runs the cleaning routine:
+      - Repeatedly run MAIN processing.
+      - When MAIN processes 0 emails, run CLEARANCE processing.
+      - If CLEARANCE also processes 0, then exit.
     """
     print("=== CLEANING ROUTINE START ===")
     while True:
-        main_processed = process_emails(rule_sheet="MainSheet")
-        if main_processed == 0:
-            # Switch to clearance
-            clearance_processed = process_emails(rule_sheet="ClearanceRules")
-            if clearance_processed < 20:
-                # Both main & clearance processed 0 => done
-                print("CLEANING DONE: No more emails to process.")
-                break
-            else:
-                # Clearance did something => keep cleaning
-                print("Cleared some emails. Continuing cleaning routine...\n")
+        main_processed = process_emails_main()
+        if main_processed > 0:
+            continue  # Keep running MAIN
+        clearance_processed = process_emails_clearance()
+        if clearance_processed == 0:
+            print("CLEANING DONE: No more emails to process in MAIN or CLEARANCE.")
+            break
         else:
-            # Main sheet processed > 0 => keep looping
-            print("Main sheet processed some emails. Continuing cleaning routine...\n")
-
+            print("Cleared some emails in CLEARANCE. Continuing cleaning routine...\n")
     print("=== CLEANING ROUTINE END ===")
+    return
+
+def clear_failed_to_review():
+    """
+    Removes 'Algorithm Failed to Review' label from all emails in the inbox.
+    """
+    service = get_gmail_service()
+    failed_label_id = get_or_create_label(service, 'Algorithm Failed to Review')
+    if not failed_label_id:
+        print("No 'Algorithm Failed to Review' label found or created.")
+        return
+    query = 'in:inbox label:"Algorithm Failed to Review"'
+    results = service.users().messages().list(userId='me', q=query).execute()
+    messages = results.get('messages', [])
+    if not messages:
+        print("No emails with 'Algorithm Failed to Review' found in inbox.")
+        return
+    for msg_info in messages:
+        msg_id = msg_info['id']
+        service.users().messages().modify(
+            userId='me',
+            id=msg_id,
+            body={'removeLabelIds': [failed_label_id]}
+        ).execute()
+    print("All 'Algorithm Failed to Review' labels removed from inbox emails.")
 
 def notify(title, message):
     subprocess.run([
         'terminal-notifier',
         '-title', title,
         '-message', message,
-        '-sound', 'Ping'  # Optional sound
+        '-sound', 'Ping'
     ])
 
-
 if __name__ == "__main__":
-    # 1) Maintenance
-    # run_maintenance()
-
-    # 2) Cleaning
+    # For cleaning routine, run MAIN repeatedly until no emails processed, then CLEARANCE.
     run_cleaning()
 
-    # Debugging
-    # run_clearance()
+    # For maintenance
+    # process_emails_main
+
+    # For debugging
+    # process_emails_clearance
+
+    # To clean up failed processes
+    # clear_failed_to_review
 
     notify("Email Cleaning", "Email cleaning process done!")
     print("All routines finished.")
-    
