@@ -17,6 +17,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
 
+
 def parse_bool_field(value, rule_name, field_name):
     """
     For boolean fields (both conditions and actions), allow only: True, False, or empty.
@@ -32,6 +33,7 @@ def parse_bool_field(value, rule_name, field_name):
         return False
     else:
         raise ValueError(f"Error in rule '{rule_name}': Field '{field_name}' must be True, False, or empty. Got: {value}")
+
 
 def get_gmail_service():
     print("Initializing Gmail service...")
@@ -69,6 +71,7 @@ def get_gmail_service():
     service = build('gmail', 'v1', credentials=creds)
     print("Gmail service initialized successfully!")
     return service
+
 
 def load_rules_from_excel(file_path, sheet_name=None):
     """Load rules from an Excel file from a specified sheet.
@@ -143,6 +146,7 @@ def load_rules_from_excel(file_path, sheet_name=None):
 
     return rules
 
+
 def get_full_body_text(payload):
     """
     Recursively extract all text (text/plain or text/html) from the message payload,
@@ -167,6 +171,7 @@ def get_full_body_text(payload):
     walk(payload)
     # Combine all text parts with a newline
     return "\n".join(parts_text)
+
 
 def evaluate_conditions(conditions, subject, sender, body, email_date, labels, service, is_important=False, attachments=None, replies_count=0):
     subject_lower = subject.lower() if subject else ''
@@ -408,6 +413,7 @@ def evaluate_logical_expression(expression, text):
     # Kick off parsing
     return parse_expr(expression)
 
+
 def get_or_create_label(service, label_name):
     """Get existing label ID or create a new one."""
     try:
@@ -415,8 +421,11 @@ def get_or_create_label(service, label_name):
         labels = results.get('labels', [])
         for label in labels:
             if label['name'].lower() == label_name.lower():
+                # print("label found")
                 return label['id']
+            
         # Create new label if not found.
+        # print("creating new label")
         new_label = {
             'name': label_name,
             'labelListVisibility': 'labelShow',
@@ -615,14 +624,13 @@ def process_emails_main():
     
     reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
     reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewing [Clearance]')
-    failed_review_id = get_or_create_label(service, 'Algorithm Failed to Review')
     pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
     
     query = (
         'in:inbox category:primary '
-        f'-label:"{reviewed_label_id}" '
-        f'-label:"{reviewing_clearance_id}" '
-        f'-label:"{failed_review_id}"'
+        '-label:"Algorithm Reviewed" '
+        '-label:"Algorithm Failed to Review" ' 
+        '-label:"Keep in Email"'
     )
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
@@ -743,8 +751,12 @@ def process_emails_clearance():
     failed_review_id = get_or_create_label(service, 'Algorithm Failed to Review')
     pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
     
-    query = f'in:inbox label:"{reviewing_clearance_id}"'
-    results = service.users().messages().list(userId='me', q=query).execute()
+    results = service.users().messages().list(
+        userId='me',
+        labelIds=[reviewing_clearance_id],  # Use label ID here
+        q='in:inbox',  # Optional: Restrict to inbox
+        includeSpamTrash=False
+    ).execute()
     messages = results.get('messages', [])
 
     if not messages:
@@ -850,8 +862,6 @@ def run_cleaning():
     print("=== CLEANING ROUTINE START ===")
     while True:
         main_processed = process_emails_main()
-        if main_processed > 0:
-            continue  # Keep running MAIN
         clearance_processed = process_emails_clearance()
         if clearance_processed == 0:
             print("CLEANING DONE: No more emails to process in MAIN or CLEARANCE.")
@@ -860,6 +870,7 @@ def run_cleaning():
             print("Cleared some emails in CLEARANCE. Continuing cleaning routine...\n")
     print("=== CLEANING ROUTINE END ===")
     return
+
 
 def clear_failed_to_review():
     """
@@ -885,6 +896,7 @@ def clear_failed_to_review():
         ).execute()
     print("All 'Algorithm Failed to Review' labels removed from inbox emails.")
 
+
 def notify(title, message):
     subprocess.run([
         'terminal-notifier',
@@ -898,13 +910,13 @@ if __name__ == "__main__":
     run_cleaning()
 
     # For maintenance
-    # process_emails_main
+    # process_emails_main()
 
     # For debugging
-    # process_emails_clearance
+    # process_emails_clearance()
 
     # To clean up failed processes
-    # clear_failed_to_review
+    # clear_failed_to_review()
 
     notify("Email Cleaning", "Email cleaning process done!")
     print("All routines finished.")
