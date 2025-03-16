@@ -1,0 +1,32 @@
+name: Email Bot - Cleaning Routine
+
+on:
+  workflow_dispatch:  # This workflow can be triggered manually
+
+jobs:
+  run-cleaning:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.9"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install google-auth google-auth-oauthlib google-api-python-client openpyxl
+
+    - name: Create credentials files
+      run: |
+        mkdir -p resources
+        echo "${{ secrets.CREDENTIALS_JSON }}" > resources/credentials.json
+        echo "${{ secrets.TOKEN_JSON }}" > resources/token.json
+
+    - name: Run CLEANING routine
+      run: |
+        python main.py cleaning

@@ -1,3 +1,4 @@
+import sys
 import re
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -289,6 +290,8 @@ def evaluate_conditions(conditions, subject, sender, body, email_date, labels, s
             if op == '>' and not (replies_count > required_count):
                 return False
             elif op == '<' and not (replies_count < required_count):
+                return False
+            elif op == '==' and not (replies_count == required_count):
                 return False
 
         else:
@@ -905,18 +908,27 @@ def notify(title, message):
         '-sound', 'Ping'
     ])
 
-if __name__ == "__main__":
-    # For cleaning routine, run MAIN repeatedly until no emails processed, then CLEARANCE.
-    run_cleaning()
-
-    # For maintenance
-    # process_emails_main()
-
-    # For debugging
-    # process_emails_clearance()
-
-    # To clean up failed processes
-    # clear_failed_to_review()
-
+def main():
+    """
+    Decide which routine to run based on command-line argument:
+      python main.py main       => run process_emails_main()
+      python main.py cleaning   => run run_cleaning()
+    Default if no argument => run_cleaning()
+    """
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+        if mode == "main":
+            process_emails_main()
+        elif mode == "cleaning":
+            run_cleaning()
+        else:
+            print(f"Unknown mode '{mode}'. Running main routine by default.")
+            process_emails_main()
+    else:
+        process_emails_main()
+    
     notify("Email Cleaning", "Email cleaning process done!")
     print("All routines finished.")
+
+if __name__ == "__main__":
+    main()
