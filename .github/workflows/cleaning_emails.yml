@@ -1,7 +1,7 @@
 name: Email Bot - Cleaning Routine
 
 on:
-  workflow_dispatch:  # This workflow can be triggered manually
+  workflow_dispatch:
 
 jobs:
   run-cleaning:
@@ -9,10 +9,10 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Updated from v3 to v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5  # Updated from v4 to v5
       with:
         python-version: "3.9"
 
@@ -24,8 +24,13 @@ jobs:
     - name: Create credentials files
       run: |
         mkdir -p resources
-        echo "${{ secrets.CREDENTIALS_JSON }}" > resources/credentials.json
-        echo "${{ secrets.TOKEN_JSON }}" > resources/token.json
+        printf "%s" "${{ secrets.CREDENTIALS_JSON }}" > resources/credentials.json
+        printf "%s" "${{ secrets.TOKEN_JSON }}" > resources/token.json
+
+    - name: Validate JSON files
+      run: |
+        python -m json.tool resources/credentials.json
+        python -m json.tool resources/token.json
 
     - name: Run CLEANING routine
       run: |
