@@ -616,9 +616,9 @@ def process_emails_main():
     """
     MAIN Routine:
       - Queries only emails that are unreviewed (i.e. not labeled as "Algorithm Reviewed",
-        "Algorithm Reviewing [Clearance]", or "Algorithm Failed to Review").
+        "Algorithm Reviewed [Need Clearance]", or "Algorithm Failed to Review").
       - Evaluates main rules; if a rule matches, the email is processed and labeled
-        "Algorithm Reviewed". If no rule matches, the email is labeled "Algorithm Reviewing [Clearance]".
+        "Algorithm Reviewed". If no rule matches, the emaieds Need labeled "Algorithm Reviewing [Clearance]".
     """
     print("\n=== Starting MAIN Processing ===")
     service = get_gmail_service()
@@ -626,7 +626,7 @@ def process_emails_main():
     print(f"Loaded {len(main_rules)} main rules from Excel")
     
     reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
-    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewing [Clearance]')
+    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewed [Need Clearance]')
     pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
     
     query = (
@@ -721,7 +721,7 @@ def process_emails_main():
             #     print(f"✗ Rule '{rule['name']}' did not match")
 
         if not rule_matched:
-            print("No MAIN rule matched; labeling 'Algorithm Reviewing [Clearance]'")
+            print("No MAIN rule matched; labeling 'Algorithm Reviewed [Need Clearance]'")
             service.users().messages().modify(
                 userId='me',
                 id=msg_id,
@@ -737,12 +737,12 @@ def process_emails_main():
 def process_emails_clearance():
     """
     CLEARANCE Routine:
-      - Processes only emails labeled "Algorithm Reviewing [Clearance]".
+      - Processes only emails labeled "Algorithm Reviewed [Need Clearance]".
       - For each email, runs clearance rules.
       - If a rule matches, handles the action, re-fetches metadata, and if the email still
-        has "Algorithm Reviewing [Clearance]" (and lacks "Algorithm Reviewed"), removes the former
+        has "Algorithm Reviewed [Need Clearance]" (and lacks "Algorithm Reviewed"), removes the former
         and adds "Algorithm Reviewed".
-      - If no clearance rule matches, removes "Algorithm Reviewing [Clearance]" and adds "Algorithm Failed to Review".
+      - If no clearance rule matches, removes "Algorithm Reviewed [Need Clearance]" and adds "Algorithm Failed to Review".
     """
     print("\n=== Starting CLEARANCE Processing ===")
     service = get_gmail_service()
@@ -750,7 +750,7 @@ def process_emails_clearance():
     print(f"Loaded {len(clearance_rules)} clearance rules from Excel")
     
     reviewed_label_id = get_or_create_label(service, 'Algorithm Reviewed')
-    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewing [Clearance]')
+    reviewing_clearance_id = get_or_create_label(service, 'Algorithm Reviewed [Need Clearance]')
     failed_review_id = get_or_create_label(service, 'Algorithm Failed to Review')
     pending_label_id = get_or_create_label(service, 'Algorithm Reviewed [Pending]')
     
@@ -838,7 +838,7 @@ def process_emails_clearance():
                         body={'removeLabelIds': [reviewing_clearance_id],
                               'addLabelIds': [reviewed_label_id]}
                     ).execute()
-                    print("Replaced 'Algorithm Reviewing [Clearance]' with 'Algorithm Reviewed' (Clearance process).")
+                    print("Replaced 'Algorithm Reviewed [Need Clearance]' with 'Algorithm Reviewed' (Clearance process).")
                 else:
                     print("Skipped label update in Clearance process; label already updated.")
                 break
