@@ -26,8 +26,8 @@ jobs:
     - name: Create credentials files
       run: |
         mkdir -p resources
-        echo "${{ secrets.CREDENTIALS_JSON }}" > resources/credentials.json
-        echo "${{ secrets.TOKEN_JSON }}" > resources/token.json
+        printf "%s" "${{ secrets.CREDENTIALS_JSON }}" > resources/credentials.json
+        printf "%s" "${{ secrets.TOKEN_JSON }}" > resources/token.json
 
     - name: Run MAIN routine
       run: |
