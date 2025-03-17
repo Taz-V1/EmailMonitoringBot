@@ -23,16 +23,14 @@ jobs:
         pip install google-auth google-auth-oauthlib google-api-python-client openpyxl
 
     - name: Create credentials.json
-      uses: jsdaniell/create-json@1.1.2
-      with:
-        name: "resources/credentials.json"
-        json: ${{ secrets.CREDENTIALS_JSON }}
+      run: |
+        mkdir -p resources
+        echo '${{ secrets.CREDENTIALS_JSON }}' > resources/credentials.json
 
     - name: Create token.json
-      uses: jsdaniell/create-json@1.1.2
-      with:
-        name: "resources/token.json"
-        json: ${{ secrets.TOKEN_JSON }}
+      run: |
+        mkdir -p resources
+        echo '${{ secrets.TOKEN_JSON }}' > resources/token.json
 
     - name: Validate JSON files
       run: |
